@@ -1,11 +1,13 @@
 """Tests for collect_contributions.py."""
 
+import time
 import types
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from github import GithubException
 
 import collect_contributions as cc
 
@@ -16,7 +18,8 @@ import collect_contributions as cc
 @pytest.fixture(autouse=True)
 def _clear_module_state():
     """Reset module-level caches/timestamps between tests."""
-    cc._search_timestamps.clear()
+    cc._search_limiter.reset()
+    cc._core_limiter.reset()
     cc._repo_cache.clear()
 
 
@@ -115,6 +118,7 @@ class TestParseArgs:
         assert args.max_reviews == 200
         assert args.max_issues == 200
         assert args.max_authored_prs == 50
+        assert args.concurrency == 4
         assert args.output_dir is None
 
     def test_custom_flags(self):
@@ -125,12 +129,14 @@ class TestParseArgs:
             "--max-authored-prs", "5",
             "--output-dir", "/tmp/out",
             "--token", "ghp_fake",
+            "--concurrency", "8",
         ])
         assert args.max_reviews == 10
         assert args.max_issues == 20
         assert args.max_authored_prs == 5
         assert args.output_dir == "/tmp/out"
         assert args.token == "ghp_fake"
+        assert args.concurrency == 8
 
     def test_token_from_env(self, monkeypatch):
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_env")
@@ -215,54 +221,47 @@ class TestCollectPrReviews:
             (tmp_path / sub).mkdir(parents=True)
         return tmp_path
 
-    @patch("collect_contributions._throttle_search")
-    def test_writes_files_for_items_with_comments(self, _throttle, tmp_path):
+    def _make_paginated(self, items):
+        paginated = MagicMock()
+        paginated.totalCount = len(items)
+        paginated.__iter__ = lambda self: iter(items)
+        return paginated
+
+    def test_writes_files_for_items_with_comments(self, tmp_path):
         out = self._setup_out_dir(tmp_path)
         items = [_make_item(number=1), _make_item(number=2)]
 
         g = MagicMock()
-        paginated = MagicMock()
-        paginated.totalCount = len(items)
-        paginated.__iter__ = lambda self: iter(items)
-        g.search_issues.return_value = paginated
+        g.search_issues.return_value = self._make_paginated(items)
 
         comment = _make_comment()
         review = _make_review()
 
-        with (
-            patch.object(cc, "fetch_user_issue_comments", return_value=[comment]),
-            patch.object(cc, "fetch_user_review_comments", return_value=[comment]),
-            patch.object(cc, "fetch_user_reviews", return_value=[review]),
+        with patch.object(
+            cc, "fetch_pr_details", return_value=([comment], [comment], [review])
         ):
-            cc.collect_pr_reviews(g, "testuser", "acme", out, max_items=10)
+            cc.collect_pr_reviews(
+                g, "testuser", "acme", out, max_items=10, concurrency=1
+            )
 
         written = list((out / "pr-reviews").glob("*.md"))
         assert len(written) == 2
 
-    @patch("collect_contributions._throttle_search")
-    def test_skips_existing_files(self, _throttle, tmp_path):
+    def test_skips_existing_files(self, tmp_path):
         out = self._setup_out_dir(tmp_path)
         items = [_make_item(number=1)]
 
-        # Pre-create the file so the collector skips it
         (out / "pr-reviews" / "repo__PR-1.md").write_text("already here")
 
         g = MagicMock()
-        paginated = MagicMock()
-        paginated.totalCount = len(items)
-        paginated.__iter__ = lambda self: iter(items)
-        g.search_issues.return_value = paginated
+        g.search_issues.return_value = self._make_paginated(items)
 
-        with (
-            patch.object(cc, "fetch_user_issue_comments") as fetch_ic,
-            patch.object(cc, "fetch_user_review_comments") as fetch_rc,
-            patch.object(cc, "fetch_user_reviews") as fetch_rv,
-        ):
-            cc.collect_pr_reviews(g, "testuser", "acme", out, max_items=10)
+        with patch.object(cc, "fetch_pr_details") as fetch_pd:
+            cc.collect_pr_reviews(
+                g, "testuser", "acme", out, max_items=10, concurrency=1
+            )
 
-        fetch_ic.assert_not_called()
-        fetch_rc.assert_not_called()
-        fetch_rv.assert_not_called()
+        fetch_pd.assert_not_called()
 
 
 # ── CLI / main smoke test ────────────────────────────────────────────
@@ -305,3 +304,125 @@ class TestMain:
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
         with pytest.raises(SystemExit):
             cc.main(["testuser", "testorg"])
+
+
+# ── RateLimiter tests ────────────────────────────────────────────────
+
+
+class TestRateLimiter:
+    def test_acquire_under_limit_does_not_sleep(self):
+        limiter = cc.RateLimiter(max_calls=5, window_seconds=60, label="test")
+        start = time.monotonic()
+        for _ in range(5):
+            limiter.acquire()
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0
+
+    def test_acquire_at_limit_sleeps(self):
+        limiter = cc.RateLimiter(max_calls=2, window_seconds=0.5, label="test")
+        limiter.acquire()
+        limiter.acquire()
+        start = time.monotonic()
+        limiter.acquire()
+        elapsed = time.monotonic() - start
+        assert elapsed >= 0.3
+
+    def test_reset_clears_timestamps(self):
+        limiter = cc.RateLimiter(max_calls=1, window_seconds=60, label="test")
+        limiter.acquire()
+        limiter.reset()
+        start = time.monotonic()
+        limiter.acquire()
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0
+
+
+# ── _with_retry tests ────────────────────────────────────────────────
+
+
+class TestWithRetry:
+    def test_returns_on_success(self):
+        result = cc._with_retry(lambda x: x * 2, 5)
+        assert result == 10
+
+    def test_retries_on_transient_error(self):
+        call_count = 0
+
+        def flaky():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise GithubException(502, {}, headers={})
+            return "ok"
+
+        with patch("collect_contributions.time.sleep"):
+            result = cc._with_retry(flaky, max_retries=3)
+
+        assert result == "ok"
+        assert call_count == 3
+
+    def test_raises_after_max_retries(self):
+        def always_fail():
+            raise GithubException(429, {}, headers={})
+
+        with patch("collect_contributions.time.sleep"):
+            with pytest.raises(GithubException):
+                cc._with_retry(always_fail, max_retries=2)
+
+    def test_raises_immediately_on_non_retryable(self):
+        def not_found():
+            raise GithubException(404, {}, headers={})
+
+        with pytest.raises(GithubException) as exc_info:
+            cc._with_retry(not_found, max_retries=3)
+        assert exc_info.value.status == 404
+
+    def test_honors_retry_after_header(self):
+        call_count = 0
+
+        def fail_once():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise GithubException(
+                    429, {}, headers={"Retry-After": "5"}
+                )
+            return "done"
+
+        with patch("collect_contributions.time.sleep") as mock_sleep:
+            result = cc._with_retry(fail_once, max_retries=3)
+
+        assert result == "done"
+        mock_sleep.assert_called_once_with(5)
+
+
+# ── concurrency collector test ───────────────────────────────────────
+
+
+class TestCollectAuthoredIssuesConcurrent:
+    def _setup_out_dir(self, tmp_path):
+        for sub in ("pr-reviews", "issues", "pr-authored"):
+            (tmp_path / sub).mkdir(parents=True)
+        return tmp_path
+
+    def test_writes_multiple_issues_concurrently(self, tmp_path):
+        out = self._setup_out_dir(tmp_path)
+        items = [_make_item(number=i) for i in range(5)]
+
+        g = MagicMock()
+        paginated = MagicMock()
+        paginated.totalCount = len(items)
+        paginated.__iter__ = lambda self: iter(items)
+        g.search_issues.return_value = paginated
+
+        comment = _make_comment()
+
+        with patch.object(
+            cc, "fetch_user_issue_comments", return_value=[comment]
+        ):
+            cc.collect_authored_issues(
+                g, "testuser", "acme", out, max_items=10, concurrency=3
+            )
+
+        written = list((out / "issues").glob("*.md"))
+        assert len(written) == 5
