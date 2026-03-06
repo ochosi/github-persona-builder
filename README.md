@@ -98,3 +98,59 @@ Review the changes in this diff and provide feedback in the style described abov
 
 $(gh pr diff 123)"
 ```
+
+## Build a persona with Cursor
+
+The fastest way to build a persona is to open this repository in [Cursor](https://cursor.sh) and let the AI agent drive the entire workflow. Copy the prompt below into Cursor's chat (Agent mode), replacing `<username>` and `<org>` with the GitHub username and organization you want to analyze.
+
+**Before you start:**
+
+- You need a **GitHub personal access token** (`GITHUB_TOKEN`). Without one, GitHub's API rate limits are severely restrictive (60 core requests/hr and 10 search requests/min unauthenticated, vs 5,000 core/hr and 30 search/min with a token). Create one at [github.com/settings/tokens](https://github.com/settings/tokens) — no special scopes are needed for public repos.
+- You can pull a **sample** of the data for a quick test, or the **full** dataset for a richer persona. The script is idempotent, so you can start with a sample and re-run with higher limits later without re-fetching existing files.
+- Persona generation is a **two-phase** process: first, three parallel analyses (PR reviews, authored issues, authored PRs), then a synthesis step that merges them into a single `persona.md`.
+
+### The prompt
+
+````text
+Build a GitHub reviewer persona for the user <username> in the <org> organization.
+Follow these steps in order:
+
+1. SETUP
+   - Run `pip install -r requirements.txt` to install dependencies.
+   - Make sure GITHUB_TOKEN is set in the environment (it is required to avoid
+     GitHub API rate limiting). If it is not set, stop and ask me to provide it.
+
+2. COLLECT DATA
+   Run `collect_contributions.py` to fetch the user's GitHub contribution history.
+
+   For a quick sample (faster, good for testing):
+   ```
+   python collect_contributions.py <username> <org> \
+       --max-reviews 30 --max-issues 20 --max-authored-prs 15
+   ```
+
+   For the full dataset (slower, produces a better persona):
+   ```
+   python collect_contributions.py <username> <org>
+   ```
+
+   Ask me whether I want a sample or the full dataset before running.
+
+3. ANALYZE (Phase 1)
+   Read the three Phase 1 analysis prompts from PERSONA_PROMPTS.md. For each one,
+   read the specified number of files from the corresponding subdirectory under
+   <username>-contributions/ and produce a detailed analysis. Write each analysis
+   to a file:
+   - <username>-contributions/analysis-pr-reviews.md
+   - <username>-contributions/analysis-issues.md
+   - <username>-contributions/analysis-authored-prs.md
+
+4. SYNTHESIZE (Phase 2)
+   Read the Phase 2 synthesis prompt from PERSONA_PROMPTS.md. Combine the three
+   analysis documents into a single reviewer persona. Write the result to:
+   - <username>-contributions/persona.md
+
+5. DONE
+   Tell me the persona is ready and show me a brief summary of the reviewer's
+   style. The full persona is in <username>-contributions/persona.md.
+````
