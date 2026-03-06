@@ -468,13 +468,8 @@ def main(argv: list[str] | None = None):
         g, args.username, args.org, out_dir, max_items=args.max_authored_prs
     )
 
-    rate = g.get_rate_limit()
     print(f"\n{'='*60}", flush=True)
-    print(f"Done! Core API remaining: {rate.core.remaining}/{rate.core.limit}", flush=True)
-    print(
-        f"      Search API remaining: {rate.search.remaining}/{rate.search.limit}",
-        flush=True,
-    )
+    print("Done!", flush=True)
     pr_reviews = len(list((out_dir / "pr-reviews").glob("*.md")))
     issues = len(list((out_dir / "issues").glob("*.md")))
     pr_authored = len(list((out_dir / "pr-authored").glob("*.md")))
